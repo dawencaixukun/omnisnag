@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniSnag</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="app-header">
+    <div class="logo-group">
+      <img src="../icons/icon48.png" alt="Logo" class="app-logo">
+      <div class="logo-text">
+        <h1 class="app-title">OmniSnag</h1>
+        <p class="app-subtitle" id="activeTabDomain">正在检测当前网页...</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button id="btnRefreshTab" class="icon-btn" title="刷新页面检测">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+      </button>
+      <button id="btnCloseEmbedded" class="icon-btn" title="关闭面板（返回网页）" style="display: none;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-target="panel-media">
+      <span class="tab-icon">🎥</span>
+      <span class="tab-label">媒体嗅探</span>
+      <span class="tab-count" id="mediaCountBadge">0</span>
+    </button>
+    <button class="nav-tab" data-target="panel-history">
+      <span class="tab-icon">🕘</span>
+      <span class="tab-label">历史</span>
+      <span class="tab-count" id="historyCountBadge">0</span>
+    </button>
+    <button class="nav-tab" data-target="panel-settings">
+      <span class="tab-icon">⚙️</span>
+      <span class="tab-label">设置</span>
+    </button>
+  </nav>
+
+  <!-- Main Container -->
+  <main class="main-content">
+    <!-- PANEL 1: MEDIA SNIFFER -->
+    <section id="panel-media" class="tab-panel active">
+      <div class="toolbar">
+        <div class="toolbar-info">
+          <span class="info-label">嗅探列表:</span>
+          <span id="mediaTotalSummary">共 0 个流媒体资源</span>
+        </div>
+        <div class="toolbar-buttons">
+          <label class="toolbar-checkbox" title="自动将同一视频的 TS 切片聚拢折叠在所属 M3U8 下方，防止列表被散落切片刷屏">
+            <input type="checkbox" id="chkFoldTs" checked> 自动收拢TS分片
+          </label>
+          <button id="btnClearMedia" class="btn btn-sm btn-outline">清空列表</button>
+          <button id="btnCopyAllMediaUrls" class="btn btn-sm btn-primary">复制全部直链</button>
+        </div>
+      </div>
+
+      <!-- Batch episode collector -->
+      <div class="batch-collect-card">
+        <div class="batch-head">
+          <button id="btnToggleBatch" class="btn btn-sm btn-outline">📺 批量采集全集（自动逐集点击）</button>
+          <span class="batch-hint">适用于 V1~V99 这类选集列表</span>
+        </div>
+        <div id="batchPanel" style="display: none;">
+          <div class="batch-form-row">
+            <label>采集模式:</label>
+            <select id="batchMode" class="form-select" style="flex: 1 1 120px; min-width: 0;" title="接口模式：直接抓列表页与播放页源码解析 m3u8，无需点击或播放视频">
+              <option value="click">🖱️ 点击模式（自动逐集点击）</option>
+              <option value="api">⚡ 接口模式（不点击、不播放）</option>
+            </select>
+          </div>
+          <div class="batch-form-row" id="batchListUrlRow" style="display: none;">
+            <label>列表页URL:</label>
+            <input id="batchListUrl" class="form-input" placeholder="留空 = 使用当前页地址" title="视频选集列表所在页面网址（接口模式）">
+          </div>
+          <div class="batch-form-row" id="batchPatternRow">
+            <label>按钮匹配正则:</label>
+            <input id="batchPattern" class="form-input" value="^V\d+$" title="匹配选集按钮的文字，如 ^V\d+$ 或 第\d+集（点击模式）">
+          </div>
+          <div class="batch-form-row" id="batchWaitRow">
+            <label>每集等待(秒):</label>
+            <input id="batchWaitSec" class="form-input" type="number" value="6" min="2" max="30">
+          </div>
+          <div class="batch-form-row">
+            <label>起始集:</label>
+            <input id="batchStartIdx" class="form-input" type="number" value="1" min="1">
+            <label>结束集:</label>
+            <input id="batchEndIdx" class="form-input" type="number" value="0" min="0" title="0 = 直到最后一集">
+          </div>
+          <div class="batch-actions-row2">
+            <button id="btnStartBatch" class="btn btn-sm btn-primary">▶ 开始自动采集</button>
+            <button id="btnCopyBatch" class="btn btn-sm btn-outline" disabled>📋 复制全部链接</button>
+            <button id="btnExportBatch" class="btn btn-sm btn-outline" disabled>💾 导出TXT</button>
+            <button id="btnQueueBatch" class="btn btn-sm btn-outline" disabled title="对已捕获的每集 m3u8 依次自动下载合并为 MP4">⬇️ 全部加入下载队列</button>
+            <button id="btnPushBatchVps" class="btn btn-sm btn-outline" disabled title="把已捕获的全部 m3u8 先探测再提交到服务端下载">☁️ 全部探测并推送</button>
+          </div>
+          <div id="batchProgress" class="batch-progress" style="display: none;"></div>
+          <div id="batchResults" class="batch-results"></div>
+        </div>
+      </div>
+
+      <!-- Real-time Download Progress Banner -->
+      <div id="downloadProgressContainer" class="download-banner" style="display: none;">
+        <div class="banner-header">
+          <div class="banner-title" id="bannerTitle">正在下载切片...</div>
+          <div class="banner-speed" id="bannerSpeed">0 MB/s</div>
+        </div>
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="bannerProgressBar" style="width: 0%;"></div>
+        </div>
+        <div class="banner-footer">
+          <span id="bannerProgressText">准备中...</span>
+          <button id="btnCancelDownload" class="btn-text">取消</button>
+        </div>
+      </div>
+
+      <!-- VPS 下载任务看板：仅当启用 VPS 时显示，且只在有活跃任务时轮询 -->
+      <div id="vpsTasksCard" class="vps-tasks-card" style="display: none;">
+        <div class="vps-tasks-head">
+          <span class="vps-tasks-title">☁️ 服务端下载任务 <span id="vpsActiveBadge" class="vps-active-badge" data-zero="1">0</span></span>
+          <div class="vps-tasks-actions">
+            <button id="btnVpsRefresh" class="btn btn-sm btn-outline">刷新</button>
+            <button id="btnVpsTogglePoll" class="btn btn-sm btn-outline" data-on="0" title="开启后仅在存在排队/下载中任务时每 2 秒轮询">轮询: 关</button>
+          </div>
+        </div>
+        <div id="vpsTasksHint" class="form-hint" style="margin-top: 4px;">尚未拉取任务列表。</div>
+        <div id="vpsTasksList" class="vps-tasks-list"></div>
+      </div>
+
+      <!-- Media Items List -->
+      <div id="mediaList" class="cards-list">
+        <div class="empty-state" id="mediaEmptyState">
+          <div class="empty-icon">📡</div>
+          <p class="empty-title">当前网页暂未捕获到音视频流</p>
+          <p class="empty-desc">请在宿主网页上点击播放视频或刷新页面，插件将自动捕获 m3u8、TS 切片及 MP4 资源与鉴权 Headers。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 1.5: PERSISTENT HISTORY -->
+    <section id="panel-history" class="tab-panel">
+      <div class="toolbar">
+        <div class="toolbar-info">
+          <span class="info-label">历史记录:</span>
+          <span id="historyTotalSummary">当前域名暂无记录</span>
+        </div>
+        <div class="toolbar-buttons">
+          <button id="btnClearHistory" class="btn btn-sm btn-outline" title="只清空当前域名的历史，其他网站的记录保留">清空本站历史</button>
+          <button id="btnCopyAllHistory" class="btn btn-sm btn-primary" title="复制当前域名下的全部直链">复制本站直链</button>
+        </div>
+      </div>
+      <div class="search-toolbar" style="margin-bottom: 10px;">
+        <input type="text" id="historySearchInput" class="search-input" placeholder="在「当前域名」的历史中按标题或 URL 过滤...">
+      </div>
+      <div id="historyList" class="cards-list">
+        <div class="empty-state" id="historyEmptyState">
+          <div class="empty-icon">🕘</div>
+          <p class="empty-title">本站暂无历史记录</p>
+          <p class="empty-desc">历史按域名隔离保存：这里只显示当前网页域名的记录，切换到其他网站会显示那个网站的。同一视频的 TS 分片会自动折叠，不会刷屏。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- PANEL 2: PAGE LINKS COLLECTOR (button-triggered overlay, stacks above current view) -->
+    <div id="panel-links" class="page-overlay" style="display: none;">
+      <div class="page-overlay-head">
+        <h3 class="page-overlay-title">🌐 网页链接检索 <span class="tab-count" id="linkCountBadge">0</span></h3>
+        <button id="btnCloseLinks" class="btn btn-sm btn-outline">✕ 关闭返回</button>
+      </div>
+      <div class="page-overlay-body">
+        <div class="links-action-bar">
+          <button id="btnCollectLinks" class="btn btn-primary btn-block">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            一键深度检索当前网页链接
+          </button>
+        </div>
+
+        <!-- Category Filter Pills -->
+        <div class="filter-pills" id="linkFilterPills">
+          <button class="pill active" data-category="all">全部 (<span id="catAllCount">0</span>)</button>
+          <button class="pill" data-category="cloud">☁️ 网盘 (<span id="catCloudCount">0</span>)</button>
+          <button class="pill" data-category="p2p">🧲 磁力/种子 (<span id="catP2pCount">0</span>)</button>
+          <button class="pill" data-category="media">🎬 媒体流 (<span id="catMediaCount">0</span>)</button>
+          <button class="pill" data-category="doc">📄 文件/压缩包 (<span id="catDocCount">0</span>)</button>
+          <button class="pill" data-category="external">🌐 外部站点 (<span id="catExtCount">0</span>)</button>
+        </div>
+
+        <!-- Filter & Search Toolbar -->
+        <div class="search-toolbar">
+          <input type="text" id="linkSearchInput" class="search-input" placeholder="输入关键字、域名或链接进行过滤...">
+          <div class="dropdown-group">
+            <button id="btnCopyFilteredLinks" class="btn btn-sm btn-outline" title="复制筛选出的链接">批量复制</button>
+            <button id="btnExportMenu" class="btn btn-sm btn-outline">导出 ▼</button>
+            <div id="exportDropdown" class="dropdown-menu" style="display: none;">
+              <button id="btnExportTxt">导出为 TXT</button>
+              <button id="btnExportCsv">导出为 CSV 表格</button>
+              <button id="btnExportJson">导出为 JSON</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Links Table / List -->
+        <div id="linksContainer" class="links-container">
+          <div class="empty-state" id="linksEmptyState">
+            <div class="empty-icon">🔗</div>
+            <p class="empty-title">点击上方按钮检索页面链接</p>
+            <p class="empty-desc">支持 DOM 节点穿透、隐藏 URL 正则提取与百度/夸克/阿里网盘提取码自动配对。</p>
+          </div>
+          <div id="linksTableWrapper" style="display: none;">
+            <table class="links-table">
+              <thead>
+                <tr>
+                  <th width="40%">链接名称 / 上下文</th>
+                  <th width="35%">URL / 提取码</th>
+                  <th width="15%">分类</th>
+                  <th width="10%">操作</th>
+                </tr>
+              </thead>
+              <tbody id="linksTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PANEL 4: SETTINGS -->
+    <section id="panel-settings" class="tab-panel">
+      <div class="settings-group">
+        <h3 class="group-title">⬇️ m3u8 下载与转封装设置</h3>
+        
+        <div class="form-row">
+          <label class="form-label">切片并发拉取数: <span id="valConcurrency">6</span></label>
+          <input type="range" id="settingConcurrency" min="2" max="16" value="6" class="form-range">
+          <span class="form-hint">并发越高下载越快；请配合下方限速间隔使用，避免触发站点风控。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">切片失败重试次数: <span id="valRetries">3</span></label>
+          <input type="range" id="settingRetries" min="1" max="5" value="3" class="form-range">
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">手动限速 · 请求间隔: <span id="valRateLimit">1000</span> ms</label>
+          <input type="range" id="settingRateLimit" min="0" max="5000" step="100" value="1000" class="form-range">
+          <span class="form-hint">两次网络请求的最小间隔，防止频繁请求导致 IP 被封。默认 1000ms；0 = 不限速，仍被封可调大至 2000~5000。</span>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3 class="group-title">🚫 嗅探黑名单</h3>
+
+        <div class="form-row">
+          <span class="form-hint">命中的域名不再嗅探媒体资源。条目匹配自身及全部子域；媒体域名或当前网页域名命中都算。仅对之后的嗅探生效，已捕获的条目不受影响。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">手动添加（域名或 URL，自动提取域名）</label>
+          <div class="bl-add-row">
+            <input type="text" id="blManualInput" class="form-input" placeholder="如 ads.cdn.com">
+            <button id="blAddBtn" class="btn btn-sm btn-primary">添加</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">批量导入（每行一条 URL 或域名）</label>
+          <textarea id="blImportText" class="form-textarea" rows="4" placeholder="https://ads.example.com/track.js&#10;https://cdn.noisy.io/v/seg.m3u8&#10;annoy-cdn.com"></textarea>
+          <div class="bl-actions">
+            <button id="blImportBtn" class="btn btn-sm btn-outline">导入</button>
+            <button id="blClearAllBtn" class="btn btn-sm btn-outline">清空全部</button>
+          </div>
+        </div>
+
+        <div class="form-row" style="margin-bottom: 0;">
+          <label class="form-label">已屏蔽 <span id="blCount">0</span> 个域名<span id="blMatchInfo" class="bl-match-info"></span></label>
+          <input type="text" id="blSearchInput" class="form-input" placeholder="🔍 过滤已有条目（输入即时匹配，长列表快速定位）" style="margin-bottom: 6px;">
+          <div id="blList" class="bl-list"></div>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <h3 class="group-title">☁️ VPS 远程下载桥接</h3>
+
+        <div class="form-row">
+          <label class="toolbar-checkbox" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="vpsEnabled"> 启用 VPS 远程下载
+          </label>
+          <span class="form-hint">开启后，媒体卡片与批量采集面板会出现「探测并推送」按钮：先由服务端探测播放列表，再提交下载。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">服务器地址</label>
+          <input type="text" id="vpsBaseUrl" class="form-input" placeholder="http://192.168.1.100:8000">
+          <span class="form-hint">只填「协议 + 域名/IP + 端口」。粘贴含 <code>/api/ext/m3u8</code> 的完整地址也会自动裁剪。若管理台是 https，这里也必须是 https，否则浏览器会拦混合内容。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">插件 Token</label>
+          <input type="password" id="vpsToken" class="form-input" placeholder="服务端 .ext_token 文件里的值" autocomplete="off">
+          <span class="form-hint">请求以 <code>X-Ext-Token</code> 头携带。在服务端 <code>.ext_token</code>（权限 0600）里查看；被重置后旧 Token 立即失效，需回来重新填写。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">请求超时: <span id="valVpsTimeout">20</span> 秒</label>
+          <input type="range" id="vpsTimeout" min="5" max="120" step="5" value="20" class="form-range">
+          <span class="form-hint">探测大播放列表可能较慢，必要时可调大。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="toolbar-checkbox" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="vpsAutoPush"> 嗅探到 m3u8 时自动提交下载
+          </label>
+          <span class="form-hint">开启后会自动探测并取最高清晰度提交（服务端负责下载与归档）。默认关闭，避免误提交一堆广告分片。</span>
+        </div>
+
+        <div class="form-row">
+          <label class="toolbar-checkbox" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="vpsAutoPoll" checked> 打开面板时轮询下载任务
+          </label>
+          <span class="form-hint">仅在存在「排队/下载中」任务时按 2 秒轮询，空闲时自动停表。</span>
+        </div>
+
+        <div class="form-row" style="margin-bottom: 0;">
+          <button id="btnTestVps" class="btn btn-sm btn-outline btn-block">🔌 测试连通性（校验地址与 Token）</button>
+          <div id="vpsTestResult" class="test-result-msg" style="display: none; margin: 8px 0 0;"></div>
+        </div>
+
+        <div class="form-row" style="margin-bottom: 0;">
+          <span class="form-hint" style="color: var(--warning);">
+            ⚠️ 服务端限制：不支持直播流（无 <code>#EXT-X-ENDLIST</code>）与 SAMPLE-AES；仅接受 http/https，且会拒绝解析到私网/环回/保留地址的目标（SSRF 护栏）。若你的片源是内网地址，服务端会以 400 拒绝。
+          </span>
+        </div>
+      </div>
+
+      <div class="settings-footer">
+        <button id="btnSaveSettings" class="btn btn-primary btn-block">保存设置</button>
+        <span id="saveStatusToast" class="save-toast" style="display: none;">已成功保存配置！</span>
+      </div>
+    </section>
+  </main>
+
+<!-- FLOATING ACTION BUTTON: 网页链接检索（小圆钮，悬浮于面板右下角，点击弹出叠加页） -->
+<button id="btnOpenLinks" class="fab-links" title="网页链接检索（网盘 / 磁力 / 媒体流）">
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+<span class="fab-badge" id="linkCountBadgeMini" data-zero="1">0</span>
+</button>
+  <!-- MODAL: CLI COMMANDS EXPORT (N_m3u8DL-RE, FFmpeg, cURL) -->
+  <div id="cliModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title">传参导出与 CLI 命令</h3>
+        <button id="btnCloseCliModal" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">已自动注入<strong>当前请求真实携带的</strong>防盗链请求头（仅包含实际捕获到的项）：</p>
+        
+        <div class="cli-tabs">
+          <button class="cli-tab active" data-tool="n_m3u8dl">N_m3u8DL-RE</button>
+          <button class="cli-tab" data-tool="ffmpeg">FFmpeg</button>
+          <button class="cli-tab" data-tool="curl">cURL</button>
+          <button class="cli-tab" data-tool="aria2">Aria2</button>
+          <button class="cli-tab" data-tool="headers">实际捕获的请求头</button>
+        </div>
+
+        <div class="cli-code-container">
+          <textarea id="cliCodeOutput" class="cli-code" readonly rows="6"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCopyCliCommand" class="btn btn-primary">复制命令到剪贴板</button>
+      </div>
+    </div>
+  </div>
+  <!-- MODAL: 通用确认 / 提示（替代原生 confirm / alert）-->
+  <div id="uiDialog" class="ui-dialog-overlay" style="display: none;">
+    <div class="ui-dialog-card" role="dialog" aria-modal="true">
+      <div class="ui-dialog-head">
+        <span class="ui-dialog-icon" id="uiDialogIcon">❓</span>
+        <h3 class="ui-dialog-title" id="uiDialogTitle">请确认</h3>
+      </div>
+      <div class="ui-dialog-body" id="uiDialogBody"></div>
+      <div class="ui-dialog-foot">
+        <button id="uiDialogCancel" class="btn btn-sm btn-outline">取消</button>
+        <button id="uiDialogOk" class="btn btn-sm btn-primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 轻量提示条（不打断操作，自动消失）-->
+  <div id="uiToastBox" class="ui-toast-box"></div>
+
+
+  <!-- MODAL: VPS 清晰度选择（探测返回 master 时弹出） -->
+  <div id="vpsVariantModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title">选择清晰度</h3>
+        <button id="btnCloseVariantModal" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc" id="vpsVariantDesc">服务端探测到这是主播放列表（master），请选择要下载的清晰度：</p>
+        <div id="vpsVariantList" class="vps-variant-list"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnCancelVariant" class="btn btn-sm btn-outline">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: VPS 探测结果（media 类型：展示分片数/时长/加密等摘要） -->
+  <div id="vpsInfoModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 class="modal-title" id="vpsInfoTitle">探测结果</h3>
+        <button id="btnCloseVpsInfo" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="vpsInfoBody" class="vps-info-body"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="btnVpsInfoSubmit" class="btn btn-sm btn-primary">提交下载</button>
+        <button id="btnVpsInfoClose" class="btn btn-sm btn-outline">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: VIDEO PREVIEW PLAYER -->
+  <div id="previewModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card modal-video">
+      <div class="modal-header">
+        <h3 class="modal-title" id="previewModalTitle">媒体流实时预览</h3>
+        <button id="btnClosePreviewModal" class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="video-wrapper">
+          <video id="previewVideoPlayer" controls autoplay playsinline style="width: 100%; max-height: 360px; background: #000; border-radius: 6px;"></video>
+        </div>
+        <p class="preview-url" id="previewModalUrl"></p>
+      </div>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

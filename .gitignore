@@ -1,0 +1,16 @@
+# Dependencies (dev-only, used by test tooling)
+node_modules/
+
+# Local agent/session artifacts
+.pi/
+
+# Build artifacts — publish via GitHub Releases instead
+*.zip
+
+# Unrelated workspace notes
+BORROW_FEATURES.md
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
