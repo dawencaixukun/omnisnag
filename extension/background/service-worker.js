@@ -15,6 +15,147 @@ const MAX_ITEMS_PER_TAB = 300;
 // Throttled UI broadcast timers per tab (prevents hundreds of full re-renders while a video streams)
 const broadcastTimers = new Map();
 
+// ==================== 防盗链凭据注入（declarativeNetRequest 会话规则） ====================
+// 为什么必须有它：fetch() 的 Headers 里设 'cookie' / 'referer' 会被浏览器静默丢弃
+// （实测发出的请求既无 Cookie 也无 Referer），所以 webRequest 抓到的凭据必须靠 DNR
+// 在请求出网前注入。规则是会话级的，用完必须撤下，且 urlFilter 只限定到媒体所在目录，
+// 避免污染同站其它请求。
+const HEADER_RULE_ID_BASE = 9200;
+let headerRuleSeq = 0;
+let headerRuleIds = new Set();
+
+// 只注入浏览器真发过的头，不伪造
+function headerRuleRequestHeaders(item) {
+  const h = (item && item.headers) || {};
+  const out = [];
+  const referer = h.referer || h.Referer || (item && item.pageUrl) || '';
+  const cookie = h.cookie || h.Cookie || '';
+  if (referer) out.push({ header: 'Referer', operation: 'set', value: referer });
+  if (cookie) out.push({ header: 'Cookie', operation: 'set', value: cookie });
+  return out;
+}
+
+function headerRuleUrlFilter(url) {
+  try {
+    const u = new URL(url);
+    // 去掉文件名保留目录：分片与播放列表通常同目录
+    return (u.origin + u.pathname.replace(/[^/]*$/, '')).replace(/[|^]/g, (c) => '\\' + c);
+  } catch (e) {
+    return null;
+  }
+}
+
+// 装规则前先撤掉上一批（同一时刻只需要一组有效规则，避免多站点互相污染）
+async function clearPreviewRules() {
+  if (!headerRuleIds.size) return;
+  const ids = Array.from(headerRuleIds);
+  headerRuleIds = new Set();
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids });
+  } catch (e) {}
+}
+
+async function installHeaderRule(item) {
+  if (!chrome.declarativeNetRequest || !chrome.declarativeNetRequest.updateSessionRules) return [];
+  await clearPreviewRules();
+  const requestHeaders = headerRuleRequestHeaders(item);
+  if (!requestHeaders.length) return [];
+  const urlFilter = headerRuleUrlFilter(item.url);
+  if (!urlFilter) return [];
+
+  const id = HEADER_RULE_ID_BASE + (headerRuleSeq++);
+  await chrome.declarativeNetRequest.updateSessionRules({
+    removeRuleIds: [id],
+    addRules: [{
+      id,
+      priority: 1,
+      action: { type: 'modifyHeaders', requestHeaders },
+      condition: { urlFilter, resourceTypes: ['xmlhttprequest', 'media', 'other'] }
+    }]
+  });
+  headerRuleIds.add(id);
+  return requestHeaders.map(r => r.header);
+}
+
+// 嗅探列表持久化：列表只在内存里，SW 被回收/浏览器关闭就丢
+// （实测：强杀 SW 后 GET_SNIFFED_MEDIA 返回空数组，而历史存档仍在）。
+//
+// 关键设计：快照按「页面 URL」而不是标签页 ID 存。
+// chrome 的 tabId 在同一次浏览器会话内稳定（足以覆盖 SW 被回收），但关掉浏览器再开就全部变化，
+// 若按 tabId 存，重启后永远对不上号 —— 所以以 pageUrl 为键，重启后回到同一个播放页仍能恢复。
+const SNIFF_LIST_KEY = 'sniffListCache';
+const SNIFF_LIST_MAX_PAGES = 40;
+const SNIFF_LIST_TTL_MS = 6 * 60 * 60 * 1000;   // 6 小时未再出现的页面快照丢弃
+
+let sniffPersistTimer = null;
+
+function persistSniffListDebounced() {
+  if (sniffPersistTimer) return;
+  sniffPersistTimer = setTimeout(() => {
+    sniffPersistTimer = null;
+    persistSniffListNow();
+  }, 500);
+}
+
+// 把当前内存态整体写盘（按页面 URL 归并；同一页面只保留最新一份）
+function persistSniffListNow() {
+  try {
+    const byPage = {};
+    const now = Date.now();
+    for (const map of tabMediaStore.values()) {
+      if (!map || map.size === 0) continue;
+      const items = Array.from(map.values());
+      // 同一标签页里的条目同源，取第一条的 pageUrl 作为该页的键
+      const pageUrl = (items.find(i => i.pageUrl) || {}).pageUrl || '';
+      if (!pageUrl) continue;
+      byPage[pageUrl] = { at: now, pageTitle: (items[0] || {}).pageTitle || '', items };
+    }
+    // 与上一次的快照合并，避免「当前标签页清空后」把其他页面的存档一起抹掉
+    chrome.storage.local.get([SNIFF_LIST_KEY], (res) => {
+      const prev = (res && res[SNIFF_LIST_KEY]) || {};
+      const merged = Object.assign({}, prev);
+      for (const [k, v] of Object.entries(byPage)) merged[k] = v;
+      // TTL + 数量上限裁剪：按最近一次出现时间保留最新的 N 个页面
+      const entries = Object.entries(merged)
+        .filter(([, v]) => v && Array.isArray(v.items) && now - (v.at || 0) <= SNIFF_LIST_TTL_MS)
+        .sort((a, b) => (b[1].at || 0) - (a[1].at || 0))
+        .slice(0, SNIFF_LIST_MAX_PAGES);
+      chrome.storage.local.set({ [SNIFF_LIST_KEY]: Object.fromEntries(entries) }).catch(() => {});
+    });
+  } catch (e) {}
+}
+
+// 清空/删除时同步收紧快照，否则「清空列表」后刷新又会把旧条目灌回来
+function dropSniffSnapshotFor(pageUrl) {
+  if (!pageUrl) return;
+  chrome.storage.local.get([SNIFF_LIST_KEY], (res) => {
+    const store = (res && res[SNIFF_LIST_KEY]) || null;
+    if (!store || !store[pageUrl]) return;
+    delete store[pageUrl];
+    chrome.storage.local.set({ [SNIFF_LIST_KEY]: store }).catch(() => {});
+  });
+}
+
+// 内存里没有该标签页的数据时，按页面 URL 从存档恢复（覆盖 SW 被回收与浏览器重启两种情况）
+function hydrateSniffListForTab(tabId, callback) {
+  chrome.storage.local.get([SNIFF_LIST_KEY], (res) => {
+    const store = (res && res[SNIFF_LIST_KEY]) || {};
+    chrome.tabs.get(tabId, (tab) => {
+      const url = (tab && tab.url) || '';
+      const entry = url ? store[url] : null;
+      if (entry && Array.isArray(entry.items) && Date.now() - (entry.at || 0) <= SNIFF_LIST_TTL_MS) {
+        if (!tabMediaStore.has(tabId)) tabMediaStore.set(tabId, new Map());
+        const m = tabMediaStore.get(tabId);
+        for (const it of entry.items) {
+          if (it && it.dedupeKey) m.set(it.dedupeKey, it);
+        }
+        updateBadge(tabId);
+      }
+      callback();
+    });
+  });
+}
+
 
 // (1) Content script asks which tab it runs in — the drawer iframe pins itself to that tab.
 // (2) The drawer iframe cannot reach the host tab's content script directly, so it asks the
@@ -713,6 +854,7 @@ async function registerMediaItem(tabId, itemData) {
   enforceTabCap(tabId);
   addToHistory(mediaItem);
   updateBadge(tabId);
+  persistSniffListDebounced();
 
   // Notify side panel (throttled: at most once per 600ms per tab)
   scheduleBroadcast(tabId);
@@ -878,13 +1020,34 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // Clear tab store on page navigation: the old page's media list is stale,
 // and keeping it alive across navigations is the main unbounded-growth leak.
+//
+// 但这里必须区分「真的换了页面」和「同一页面的状态变更」：
+// 单页应用（SPA）与播放器会用 history.pushState 改 URL，此时 status 也是 'loading'，
+// 旧实现会把刚嗅到的列表连同来源页一起清掉 —— 用户表现为「点了一下选集，列表空了」。
+// 因此：只有「页面来源变了（host/路径都不同）」才清；同页面的 URL 微调不动列表。
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading' && changeInfo.url) {
-    if (tabMediaStore.has(tabId) && tabMediaStore.get(tabId).size > 0) {
-      tabMediaStore.get(tabId).clear();
-      updateBadge(tabId);
+  if (changeInfo.status !== 'loading' || !changeInfo.url) return;
+  if (!tabMediaStore.has(tabId) || tabMediaStore.get(tabId).size === 0) return;
+
+  const items = Array.from(tabMediaStore.get(tabId).values());
+  const prevPageUrl = (items.find(i => i.pageUrl) || {}).pageUrl || '';
+  const samePage = (() => {
+    if (!prevPageUrl) return false;
+    try {
+      const a = new URL(prevPageUrl);
+      const b = new URL(changeInfo.url);
+      // 同 host + 同 path 视为同一页面（只是 hash/query 变化），保留已嗅到的条目
+      return a.host === b.host && a.pathname === b.pathname;
+    } catch (e) {
+      return false;
     }
-  }
+  })();
+
+  if (samePage) return;
+
+  tabMediaStore.get(tabId).clear();
+  updateBadge(tabId);
+  persistSniffListDebounced();
 });
 
 // ==================== VPS 远程下载桥接（M3U8 下载桥接服务） ====================
@@ -900,7 +1063,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 const VPS_API_PREFIX = '/api/ext/m3u8';
 
 const VPS_DEFAULTS = {
-  enabled: false,
+  // 与 sidepanel 侧默认值保持一致：本项目主导路径是「放到 VPS 下载」，默认开启
+  enabled: true,
   baseUrl: '',
   token: '',
   timeout: 20000,
@@ -1090,8 +1254,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Get sniffed media list for current tab
   if (message.type === 'GET_SNIFFED_MEDIA') {
     const tabId = message.tabId;
-    const items = tabMediaStore.has(tabId) ? Array.from(tabMediaStore.get(tabId).values()) : [];
-    sendResponse({ success: true, items });
+    const present = tabMediaStore.has(tabId) ? Array.from(tabMediaStore.get(tabId).values()) : [];
+    if (present.length > 0 || tabId == null || tabId < 0) {
+      // 注意：items 必须是原始（未归一化）对象，下载流程依赖 dedupeKey 等字段
+      sendResponse({ success: true, items: present });
+      return true;
+    }
+    // 内存为空 → 尝试按页面 URL 从持久化快照恢复（SW 被回收 / 浏览器重启后的第一次查询）
+    hydrateSniffListForTab(tabId, () => {
+      const items = tabMediaStore.has(tabId) ? Array.from(tabMediaStore.get(tabId).values()) : [];
+      sendResponse({ success: true, items, hydrated: items.length > 0 });
+    });
     return true;
   }
 
@@ -1102,6 +1275,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       tabMediaStore.get(tabId).clear();
       updateBadge(tabId);
     }
+    chrome.tabs.get(tabId, (tab) => {
+      if (tab && tab.url) dropSniffSnapshotFor(tab.url);
+    });
     sendResponse({ success: true });
     return true;
   }
@@ -1128,6 +1304,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     all.sort((a, b) => (b.lastSeen || b.time || 0) - (a.lastSeen || a.time || 0));
     sendResponse({ success: true, items: all, domains: Object.keys(historyStore) });
+    return true;
+  }
+
+  // 安装/撤下「防盗链头注入」规则。三处调用：
+  //   PREVIEW_RULES ← 侧边栏预览弹窗
+  //   DNR_INSTALL   ← 离屏文档的下载流程（离屏只能访问 chrome.runtime，规则必须由后台装）
+  //   DNR_CLEAR     ← 任务结束/关闭弹窗
+  // 侧边栏与离屏都是扩展页面，直接把受保护直链塞进 <video> / fetch 会 403
+  // （预览实测 code=4 DEMUXER_ERROR_COULD_NOT_PARSE），只能靠会话级 DNR 规则注入 Referer/Cookie。
+  if (message.type === 'PREVIEW_RULES' || message.type === 'DNR_INSTALL' || message.type === 'DNR_CLEAR') {
+    (async () => {
+      try {
+        if (message.type === 'DNR_CLEAR' || message.action === 'clear') {
+          await clearPreviewRules();
+          sendResponse({ success: true, cleared: true });
+          return;
+        }
+        const injected = await installHeaderRule(message.mediaItem || {});
+        sendResponse({ success: true, injected });
+      } catch (e) {
+        sendResponse({ success: false, error: e && e.message });
+      }
+    })();
     return true;
   }
 

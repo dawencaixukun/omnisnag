@@ -6,6 +6,38 @@
 // Active download tasks: taskId -> AbortController
 const activeTasks = new Map();
 
+// 注入凭据的方式：fetch 的 Headers 里设 'cookie'/'referer' 会被浏览器静默丢弃
+// （实测发出的请求既无 Cookie 也无 Referer），必须用 declarativeNetRequest 的会话规则。
+//
+// 关键约束：离屏文档只被允许访问 chrome.runtime，拿不到 declarativeNetRequest——
+// 所以真正装规则的动作必须交给后台 service worker 做，这里只负责转发。
+function dnrrInstall(mediaItem) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'DNR_INSTALL', mediaItem }, (res) => {
+      void chrome.runtime.lastError;
+      resolve(res || { success: false });
+    });
+  });
+}
+
+function dnrClear() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'DNR_CLEAR' }, (res) => {
+      void chrome.runtime.lastError;
+      resolve(res || { success: false });
+    });
+  });
+}
+
+// 兼容旧调用名（下面的下载流程里用的是 installDnrHeaders / clearDnrHeaders）
+async function installDnrHeaders(mediaItem) {
+  return dnrrInstall(mediaItem);
+}
+
+async function clearDnrHeaders() {
+  return dnrClear();
+}
+
 // Helper: Custom fetch with auth headers and timeout
 async function fetchWithHeaders(url, headers = {}, options = {}) {
   const reqHeaders = new Headers();
@@ -30,7 +62,9 @@ async function fetchWithHeaders(url, headers = {}, options = {}) {
       method: options.method || 'GET',
       headers: reqHeaders,
       signal: options.signal ? options.signal : controller.signal,
-      credentials: 'omit'
+      // include：offscreen 文档带扩展源，对受保护站点不一定有会话 cookie，
+      // 但至少能在同源/已授权场景带上；跨站凭据的兜底由上面的 DNR 规则负责。
+      credentials: 'include'
     });
     clearTimeout(timeoutId);
     if (!res.ok) {
@@ -173,6 +207,9 @@ async function startM3u8Download(mediaItem, options = {}) {
   try {
     sendProgress({ status: 'fetching_m3u8', message: '正在拉取与解析 M3U8 索引文件...', percent: 0 });
 
+    // 0. 注入抓到的防盗链凭据（Referer/Cookie 无法由 fetch headers 设置，必须走 DNR）
+    await installDnrHeaders(mediaItem);
+
     // 1. Fetch M3U8
     await rateGate(rateLimitMs);
     const m3u8Res = await fetchWithHeaders(mediaItem.url, headers, { signal: abortController.signal });
@@ -290,7 +327,9 @@ async function startM3u8Download(mediaItem, options = {}) {
     // 4. Transmux TS -> MP4 using mux.js
     sendProgress({ status: 'transmuxing', message: '正在无损转封装为标准 MP4 格式...', percent: 92 });
 
-    const mp4Blob = await transmuxToMp4(downloadedBuffers);
+    const { blob: rawBlob, duration } = await transmuxToMp4(downloadedBuffers);
+    // 修补 mvhd/mdhd/tkhd 时长：mux.js 写的是 0xFFFFFFFF(未知)，播放器进度条会失控
+    const mp4Blob = new Blob([mp4PatchDurations(await rawBlob.arrayBuffer(), duration)], { type: 'video/mp4' });
     downloadedBuffers.length = 0; // release TS buffers promptly (large videos can hold GBs)
 
     // 5. Trigger download save
@@ -329,6 +368,7 @@ async function startM3u8Download(mediaItem, options = {}) {
     });
   } finally {
     activeTasks.delete(taskId);
+    await clearDnrHeaders();
   }
 }
 async function startMergeTsDownload(tsItems, options = {}, taskIdOverride) {
@@ -338,6 +378,9 @@ async function startMergeTsDownload(tsItems, options = {}, taskIdOverride) {
   const concurrency = options.concurrency || 6;
   const maxRetries = options.retries || 3;
   const rateLimitMs = Math.max(0, Number(options.rateLimit ?? 1000) || 0);
+
+  // 分片组没有独立的播放列表条目，凭据挂在第一个分片上（同域同目录，作用域一致）
+  await installDnrHeaders((tsItems && tsItems[0]) || {});
 
   function sendProgress(data) {
     chrome.runtime.sendMessage({
@@ -420,7 +463,11 @@ async function startMergeTsDownload(tsItems, options = {}, taskIdOverride) {
     });
     const mp4Blob = useFmp4
       ? concatFmp4Segments(downloadedBuffers)
-      : await transmuxToMp4(downloadedBuffers);
+      : await (async () => {
+          const { blob: rawBlob, duration } = await transmuxToMp4(downloadedBuffers);
+          // 与单文件下载一致：补上 mvhd/mdhd/tkhd 的真实时长
+          return new Blob([mp4PatchDurations(await rawBlob.arrayBuffer(), duration)], { type: 'video/mp4' });
+        })();
     downloadedBuffers.length = 0; // release TS buffers promptly (large videos can hold GBs)
     const safeTitle = (tsItems[0]?.pageTitle || 'merged_video')
       .replace(/[\\/:*?"<>|]/g, '_')
@@ -451,6 +498,7 @@ async function startMergeTsDownload(tsItems, options = {}, taskIdOverride) {
     });
   } finally {
     activeTasks.delete(taskId);
+    await clearDnrHeaders();
   }
 }
 
@@ -470,23 +518,141 @@ function isFmp4Segments(items) {
 }
 
 // Transmux TS segment buffers into MP4 Blob
-function transmuxToMp4(tsBuffers) {
+//
+// 关键：mux.js 每调用一次 flush() 就会触发一次 'done'，而每次 done 只覆盖「本批 push 进去
+// 的那一段」。旧实现用 `on('done')` 直接 resolve()，于是第一段一到就收工 —— 8 段视频只
+// 产出第 1 段的 2 秒（实测 120 帧输入 → 30 帧输出，且与「只喂第 1 段」字节完全一致）。
+// 因此必须等最后一段的 done 才结算。返回 { blob, duration }。
+// TS 分片时长探测：mux.js 产出的 fMP4 会把 mvhd/mdhd/tkhd 的时长写成 0xFFFFFFFF
+// （流式语义：总长未知），播放器进度条与 seek 会异常。分片本身自带 PTS，
+// 这里扫描 188 字节 TS 包中的视频 PES PTS，得到「真实总时长」，用于事后修补。
+const TS_PACKET_SIZE = 188;
+
+function tsReadPts(buf, off) {
+  const b = (i) => buf[off + i];
+  const p32_30 = (b(0) >> 1) & 0x07;
+  const p29_15 = ((b(1) << 7) | (b(2) >> 1)) & 0x7fff;
+  const p14_0 = ((b(3) << 7) | (b(4) >> 1)) & 0x7fff;
+  return (p32_30 * 2 ** 30) + (p29_15 * 2 ** 15) + p14_0;
+}
+
+function tsProbeDuration(buffers) {
+  const ptsList = [];
+  for (const buf of buffers) {
+    if (!buf) continue;
+    const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    for (let p = 0; p + TS_PACKET_SIZE <= b.length; p += TS_PACKET_SIZE) {
+      if (b[p] !== 0x47) continue;                              // sync byte
+      if ((b[p + 1] & 0x40) === 0) continue;                    // 仅看 PES 起始包
+      const pid = ((b[p + 1] & 0x1f) << 8) | b[p + 2];
+      if (pid === 0x1fff) continue;                             // 空包
+      const afc = (b[p + 3] >> 4) & 0x03;
+      let off = p + 4;
+      if (afc & 0x02) {
+        if (off >= b.length) continue;
+        off += 1 + b[off];                                      // 跳过 adaptation field
+      }
+      if (!(afc & 0x01)) continue;
+      if (off + 9 > b.length) continue;
+      if (b[off] !== 0x00 || b[off + 1] !== 0x00 || b[off + 2] !== 0x01) continue;   // PES 起始码
+      const streamId = b[off + 3];
+      if (streamId < 0xE0 || streamId > 0xEF) continue;         // 仅视频流
+      const ptsDts = (b[off + 7] >> 6) & 0x03;
+      if (ptsDts !== 0x02 && ptsDts !== 0x03) continue;
+      ptsList.push(tsReadPts(b, off + 9));
+    }
+  }
+  if (ptsList.length < 2) return null;
+  ptsList.sort((a, b) => a - b);
+  const uniq = [...new Set(ptsList)];
+  const deltas = [];
+  for (let i = 1; i < uniq.length; i++) deltas.push(uniq[i] - uniq[i - 1]);
+  deltas.sort((a, b) => a - b);
+  const frameDur = deltas.length ? deltas[Math.floor(deltas.length / 2)] : 3000;
+  return (uniq[uniq.length - 1] - uniq[0] + frameDur) / 90000;   // 90kHz 时钟
+}
+
+// 把 mvhd / mdhd / tkhd 里的 0xFFFFFFFF(未知) 时长改成真实值。
+// box 内偏移（相对 box 起点）：version/flags@8；v0 → timescale@20、duration@24；
+// v1 → timescale@28、duration@32。tkhd 无 timescale，按 mvhd 的 90000 计。
+// 注意：离屏文档没有 Node 的 Buffer，必须用 DataView（32 位为大端）。
+function mp4PatchDurations(input, seconds) {
+  if (!seconds || !isFinite(seconds) || seconds <= 0) return input;
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const out = new Uint8Array(bytes);            // 复制一份，不改调用方数据
+  const view = new DataView(out.buffer);
+  const typeAt = (off) => String.fromCharCode(out[off + 4], out[off + 5], out[off + 6], out[off + 7]);
+
+  function walk(off, end) {
+    while (off < end - 8) {
+      const size = view.getUint32(off, false);
+      if (size < 8) break;
+      const typ = typeAt(off);
+      if (typ === 'mvhd' || typ === 'mdhd' || typ === 'tkhd') {
+        const ver = out[off + 8];
+        let ts = 90000, durOff;
+        if (typ === 'mvhd' || typ === 'mdhd') {
+          if (ver === 0) { ts = view.getUint32(off + 20, false); durOff = off + 24; }
+          else { ts = view.getUint32(off + 28, false); durOff = off + 32; }
+        } else {
+          durOff = ver === 0 ? off + 28 : off + 32;
+        }
+        if (ts) {
+          const dur = Math.round(seconds * ts);
+          try {
+            if (ver === 0) view.setUint32(durOff, dur >>> 0, false);
+            else view.setBigUint64(durOff, BigInt(dur), false);
+          } catch (e) {}
+        }
+      } else if (typ === 'moov' || typ === 'trak' || typ === 'mdia') {
+        walk(off + 8, off + size);
+      }
+      off += size;
+    }
+  }
+  walk(0, out.length);
+  return out;
+}
+
+function transmuxToMp4(tsBuffers, knownDuration) {
   return new Promise((resolve, reject) => {
     try {
-      if (typeof muxjs === 'undefined' || !muxjs.mp4 || !muxjs.mp4.Transmuxer) {
-        // Fallback if muxjs is unavailable: concatenate raw buffers
-        const combined = new Blob(tsBuffers.filter(Boolean), { type: 'video/mp2t' });
-        resolve(combined);
+      const usable = (tsBuffers || []).filter(b => b && b.byteLength > 0);
+      if (usable.length === 0) {
+        reject(new Error('没有可转封装的 TS 分片数据'));
         return;
       }
 
-      const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
+      if (typeof muxjs === 'undefined' || !muxjs.mp4 || !muxjs.mp4.Transmuxer) {
+        // Fallback if muxjs is unavailable: concatenate raw buffers
+        resolve(new Blob(usable, { type: 'video/mp2t' }));
+        return;
+      }
+
+      // keepOriginalTimestamps 必须关掉：开启时 mux.js 会把各分片原始 PTS 原样搬进 mp4，
+      // 若首片 PTS 不从 0 开始（实测素材从 1.423s 开始），产物开头会留一段空档，
+      // 表现为「时长比实际长 1.4 秒、开头黑屏」。关掉后时间轴从 0 重新对齐。
+      const transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: false });
       const mp4Segments = [];
       let initSegment = null;
+      let doneCount = 0;
+      let settled = false;
+
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        const parts = [];
+        if (initSegment) parts.push(initSegment);
+        parts.push(...mp4Segments);
+        // 用分片 PTS 推出的真实时长为 mvhd/mdhd/tkhd 补上时长（mux.js 写的是"未知"）
+        const duration = knownDuration || tsProbeDuration(usable);
+        const blob = new Blob(parts, { type: 'video/mp4' });
+        resolve({ blob, duration });
+      };
 
       transmuxer.on('data', (segment) => {
         if (!initSegment && segment.initSegment) {
-          initSegment = segment.initSegment;
+          initSegment = segment.initSegment;   // moov：只取第一份
         }
         if (segment.data) {
           mp4Segments.push(new Uint8Array(segment.data));
@@ -494,24 +660,20 @@ function transmuxToMp4(tsBuffers) {
       });
 
       transmuxer.on('done', () => {
-        const parts = [];
-        if (initSegment) {
-          parts.push(initSegment);
-        }
-        parts.push(...mp4Segments);
-        const finalBlob = new Blob(parts, { type: 'video/mp4' });
-        resolve(finalBlob);
+        doneCount += 1;
+        // 每 flush 一次就触发一次 done，必须等最后一段才结算
+        if (doneCount >= usable.length) settle();
       });
 
-      // Feed segments in sequence
-      for (const buf of tsBuffers) {
-        if (buf && buf.byteLength > 0) {
-          transmuxer.push(new Uint8Array(buf));
-          transmuxer.flush();
-        }
+      // Feed segments in sequence：逐段 push + flush，保证每段都有自己的片长信息
+      for (const buf of usable) {
+        transmuxer.push(new Uint8Array(buf));
+        transmuxer.flush();
       }
 
-      transmuxer.end();
+      // 兜底：若 mux.js 少发了 done，等一小段空闲时间后按已收集到的内容结算，
+      // 避免下载任务永远卡在「转封装中」。已正常 done 的情况下 settle 幂等。
+      setTimeout(settle, 1500);
     } catch (e) {
       reject(e);
     }

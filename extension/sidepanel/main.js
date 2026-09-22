@@ -11,15 +11,16 @@ const state = {
   activeTabUrl: '',
   activeTabTitle: '',
   mediaItems: [],
-  pageLinks: [],
-  pageInfo: null,
-  activeCategory: 'all',
   foldTs: true,
   expandedTsGroups: new Set(),
   historyItems: [],
   historyQuery: '',
   historyDomain: '',        // 当前展示的历史域名
   historyDomains: [],       // 后台已有历史的全部域名（仅用于统计提示）
+  // 侧边栏自己成为「当前活动标签页」时（域名变成扩展 ID），用它记住上一个真实站点，
+  // 否则历史面板会拿扩展 ID 去查历史，永远显示「暂无记录」。
+  lastSiteDomain: '',
+  lastSiteUrl: '',
   historyShowAllLimit: 80,  // 单次最多渲染条数，防止一次铺开几百条
   historyClearedAt: null,   // { domain, at }：清空后的墓碑，避免轮询把旧数据拉回
   _uiDialogResolve: null,   // 面板内弹窗的 Promise 结算函数
@@ -41,8 +42,9 @@ const state = {
     retries: 3,
     rateLimit: 1000,
     // VPS 远程下载桥接（接口契约已定稿：/api/ext/m3u8/* + X-Ext-Token）
+    // 本项目主导路径是「放到 VPS 下载」，因此默认开启；浏览器内下载为备用。
     vps: {
-      enabled: false,
+      enabled: true,
       baseUrl: '',
       token: '',
       timeout: 20000,
@@ -72,7 +74,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   initNavigation();
   initSettingsEvents();
   initMediaEvents();
-  initLinksEvents();
   initModals();
   initHistoryEvents();
   initBatchEvents();
@@ -179,9 +180,16 @@ function isHistoryPanelActive() {
 function currentHistoryDomain() {
   const raw = state.activeTabUrl || '';
   try {
-    return new URL(raw).hostname.toLowerCase() || '(未知来源)';
+    const host = new URL(raw).hostname.toLowerCase();
+    // 侧边栏/页内面板自身作为活动标签时，这里会解析出扩展 ID（或空 host），
+    // 那不是用户在看视频的站点；退回上一次记录的真实站点域名。
+    if (!host || raw.startsWith('chrome-extension://')) {
+      return state.lastSiteDomain || '(未知来源)';
+    }
+    return host || '(未知来源)';
   } catch (e) {
-    return raw ? '(无法解析来源)' : '(未知来源)';
+    if (raw.startsWith('chrome-extension://')) return state.lastSiteDomain || '(未知来源)';
+    return raw ? '(无法解析来源)' : (state.lastSiteDomain || '(未知来源)');
   }
 }
 
@@ -391,6 +399,15 @@ async function refreshActiveTab() {
       state.activeTabUrl = tab.url || '';
       state.activeTabTitle = tab.title || '';
 
+      // 只在「真实站点」上更新站点记忆；侧边栏自身/扩展页不覆盖，
+      // 这样历史面板在侧边栏获得焦点时仍能显示用户真正在看的那个站点的历史。
+      if (tab.url && !tab.url.startsWith('chrome-extension://') && !tab.url.startsWith('chrome://') && !tab.url.startsWith('about:')) {
+        try {
+          state.lastSiteDomain = new URL(tab.url).hostname.toLowerCase() || state.lastSiteDomain;
+          state.lastSiteUrl = tab.url;
+        } catch (e) {}
+      }
+
       const domainEl = document.getElementById('activeTabDomain');
       try {
         const u = new URL(tab.url);
@@ -452,20 +469,6 @@ function initNavigation() {
         initVpsTaskBoard();
       }
     });
-  });
-
-  // 网页链接叠加层：按钮打开，覆盖当前画面，关闭/返回/Esc 退出
-  const linksOverlay = document.getElementById('panel-links');
-  document.getElementById('btnOpenLinks').addEventListener('click', () => {
-    linksOverlay.style.display = 'flex';
-  });
-  document.getElementById('btnCloseLinks').addEventListener('click', () => {
-    linksOverlay.style.display = 'none';
-  });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && linksOverlay.style.display !== 'none') {
-      linksOverlay.style.display = 'none';
-    }
   });
 
   document.getElementById('btnRefreshTab').addEventListener('click', async () => {
@@ -1078,9 +1081,9 @@ function buildGroupCard(group) {
     actionsHtml = `
       <div class="card-actions">
         <button class="btn btn-sm btn-outline btn-preview" data-id="${item.id}">🎬 预览</button>
-        <button class="btn btn-sm btn-primary btn-download" data-id="${item.id}">⬇️ 浏览器下载</button>
-        ${tsList.length ? `<button class="btn btn-sm btn-primary btn-merge-ts">🧩 合并${tsList.length}片为MP4</button>` : ''}
         ${vpsButtonHtml()}
+        ${tsList.length ? `<button class="btn btn-sm btn-outline btn-merge-ts">🧩 合并${tsList.length}片为MP4</button>` : ''}
+        ${browserDownloadButtonHtml('btn-download')}
         <button class="btn btn-sm btn-outline btn-cli" data-id="${item.id}">⚡ 传参导出(CLI)</button>
         <button class="btn btn-sm btn-outline btn-copy-url" data-id="${item.id}">📋 复制直链</button>
       </div>`;
@@ -1088,8 +1091,8 @@ function buildGroupCard(group) {
     actionsHtml = `
       <div class="card-actions">
         <button class="btn btn-sm btn-outline btn-preview" data-id="${item.id}">🎬 预览</button>
-        <button class="btn btn-sm btn-primary btn-download" data-id="${item.id}">⬇️ 浏览器下载</button>
         ${vpsButtonHtml()}
+        ${browserDownloadButtonHtml('btn-download')}
         <button class="btn btn-sm btn-outline btn-cli" data-id="${item.id}">⚡ 传参导出(CLI)</button>
         <button class="btn btn-sm btn-outline btn-copy-url" data-id="${item.id}">📋 复制直链</button>
       </div>`;
@@ -1163,7 +1166,7 @@ function buildGroupCard(group) {
       pushVpsBtn.textContent = '☁️ 探测中...';
       probeThenSubmit(item, {}).finally(() => {
         pushVpsBtn.disabled = false;
-        pushVpsBtn.textContent = '☁️ 探测并推送';
+        pushVpsBtn.textContent = '☁️ 推送下载(主)';
       });
     });
   }
@@ -1333,223 +1336,6 @@ function triggerBrowserDownload(item) {
   });
 }
 
-// 5. Page Links Collector (Panel 2)
-function initLinksEvents() {
-  document.getElementById('btnCollectLinks').addEventListener('click', async () => {
-    const btn = document.getElementById('btnCollectLinks');
-    btn.disabled = true;
-    btn.innerHTML = '正在深度扫描网页链接...';
-
-    try {
-      chrome.tabs.sendMessage(state.activeTabId, { type: 'COLLECT_PAGE_LINKS' }, (response) => {
-        btn.disabled = false;
-        btn.innerHTML = `
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-          一键深度检索当前网页链接
-        `;
-
-        if (response && response.success) {
-          state.pageLinks = response.links || [];
-          state.pageInfo = response.pageInfo || null;
-          updateLinkStats();
-          renderLinksTable();
-        } else {
-          uiToast('未能在此页面检索到链接（页面未完全加载或受保护页面）', 'warn');
-        }
-      });
-    } catch (e) {
-      btn.disabled = false;
-      uiAlert(`扫描失败: ${e.message}`, { kind: 'error', title: '检索失败' });
-    }
-  });
-
-  // Filter pills
-  const pills = document.querySelectorAll('#linkFilterPills .pill');
-  pills.forEach(pill => {
-    pill.addEventListener('click', () => {
-      pills.forEach(p => p.classList.remove('active'));
-      pill.classList.add('active');
-      state.activeCategory = pill.getAttribute('data-category');
-      renderLinksTable();
-    });
-  });
-
-  // Real-time search
-  const searchInput = document.getElementById('linkSearchInput');
-  searchInput.addEventListener('input', () => {
-    renderLinksTable();
-  });
-
-  // Batch copy filtered
-  document.getElementById('btnCopyFilteredLinks').addEventListener('click', () => {
-    const filtered = getFilteredLinks();
-    if (filtered.length === 0) {
-      uiToast('当前没有可复制的链接', 'warn');
-      return;
-    }
-    const text = filtered.map(item => {
-      let line = item.url;
-      if (item.code) line += ` (提取码: ${item.code})`;
-      if (item.text) line += ` - ${item.text}`;
-      return line;
-    }).join('\n');
-    copyText(text, `已复制 ${filtered.length} 条链接`);
-  });
-
-  // Export dropdown
-  const exportBtn = document.getElementById('btnExportMenu');
-  const exportMenu = document.getElementById('exportDropdown');
-  exportBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    exportMenu.style.display = exportMenu.style.display === 'none' ? 'flex' : 'none';
-  });
-  document.addEventListener('click', () => {
-    exportMenu.style.display = 'none';
-  });
-
-  document.getElementById('btnExportTxt').addEventListener('click', () => exportLinks('txt'));
-  document.getElementById('btnExportCsv').addEventListener('click', () => exportLinks('csv'));
-  document.getElementById('btnExportJson').addEventListener('click', () => exportLinks('json'));
-  document.getElementById('btnExportJson').addEventListener('click', () => exportLinks('json'));
-}
-function updateLinkStats() {
-  const links = state.pageLinks;
-  document.getElementById('linkCountBadge').textContent = links.length;
-  const miniBadge = document.getElementById('linkCountBadgeMini');
-  if (miniBadge) {
-    miniBadge.textContent = links.length;
-    miniBadge.setAttribute('data-zero', links.length ? '0' : '1');
-  }
-  document.getElementById('catAllCount').textContent = links.length;
-
-  const countByCat = (c) => links.filter(l => l.category === c).length;
-  document.getElementById('catCloudCount').textContent = countByCat('cloud');
-  document.getElementById('catP2pCount').textContent = countByCat('p2p');
-  document.getElementById('catMediaCount').textContent = countByCat('media');
-  document.getElementById('catDocCount').textContent = countByCat('doc');
-  document.getElementById('catExtCount').textContent = countByCat('external');
-}
-
-function getFilteredLinks() {
-  const query = (document.getElementById('linkSearchInput').value || '').toLowerCase().trim();
-  return state.pageLinks.filter(item => {
-    if (state.activeCategory !== 'all' && item.category !== state.activeCategory) {
-      return false;
-    }
-    if (query) {
-      const matchText = (item.text || '').toLowerCase().includes(query);
-      const matchUrl = (item.url || '').toLowerCase().includes(query);
-      const matchDomain = (item.domain || '').toLowerCase().includes(query);
-      if (!matchText && !matchUrl && !matchDomain) return false;
-    }
-    return true;
-  });
-}
-
-function renderLinksTable() {
-  const emptyState = document.getElementById('linksEmptyState');
-  const tableWrapper = document.getElementById('linksTableWrapper');
-  const tbody = document.getElementById('linksTableBody');
-
-  const filtered = getFilteredLinks();
-
-  if (state.pageLinks.length === 0) {
-    emptyState.style.display = 'flex';
-    tableWrapper.style.display = 'none';
-    return;
-  }
-
-  emptyState.style.display = 'none';
-  tableWrapper.style.display = 'block';
-  tbody.innerHTML = '';
-
-  const displayList = filtered.slice(0, 100); // Top 100 for fast UI performance
-  displayList.forEach(item => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>
-        <div class="link-name" title="${escapeHtml(item.text || item.url)}">${escapeHtml(item.text || '(无标题)')}</div>
-      </td>
-      <td>
-        <div class="link-url-box" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</div>
-        ${item.code ? `<span class="code-badge" title="点击复制提取码">提取码: ${escapeHtml(item.code)}</span>` : ''}
-      </td>
-      <td>
-        <span class="tag-pill">${escapeHtml(getCategoryLabel(item.category))}</span>
-      </td>
-      <td>
-        <button class="btn btn-sm btn-outline btn-copy-single" title="复制链接">复制</button>
-      </td>
-    `;
-
-    const codeBadge = tr.querySelector('.code-badge');
-    if (codeBadge) {
-      codeBadge.addEventListener('click', (e) => {
-        e.stopPropagation();
-        copyText(item.code, '提取码已复制');
-      });
-    }
-
-    tr.querySelector('.btn-copy-single').addEventListener('click', () => {
-      let copyStr = item.url;
-      if (item.code) copyStr += ` 提取码: ${item.code}`;
-      copyText(copyStr, '链接已复制');
-    });
-
-    tbody.appendChild(tr);
-  });
-}
-
-function getCategoryLabel(cat) {
-  const map = {
-    cloud: '☁️ 网盘',
-    p2p: '🧲 磁力',
-    media: '🎬 媒体',
-    doc: '📄 文件',
-    internal: '🏠 站内',
-    external: '🌐 外链',
-    other: '其他'
-  };
-  return map[cat] || cat;
-}
-
-function exportLinks(format) {
-  const filtered = getFilteredLinks();
-  if (filtered.length === 0) {
-    uiToast('当前没有可导出的链接', 'warn');
-    return;
-  }
-
-  let content = '';
-  let mimeType = 'text/plain';
-  let ext = 'txt';
-
-  if (format === 'txt') {
-    content = filtered.map(l => `${l.url}${l.code ? ` (提取码: ${l.code})` : ''} ${l.text ? `- ${l.text}` : ''}`).join('\n');
-    mimeType = 'text/plain;charset=utf-8';
-    ext = 'txt';
-  } else if (format === 'csv') {
-    content = '\uFEFF名称,URL,分类,提取码,域名\n';
-    filtered.forEach(l => {
-      content += `"${(l.text || '').replace(/"/g, '""')}","${l.url}","${l.category}","${l.code || ''}","${l.domain}"\n`;
-    });
-    mimeType = 'text/csv;charset=utf-8';
-    ext = 'csv';
-  } else if (format === 'json') {
-    content = JSON.stringify(filtered, null, 2);
-    mimeType = 'application/json;charset=utf-8';
-    ext = 'json';
-  }
-
-  const blob = new Blob([content], { type: mimeType });
-  const blobUrl = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = blobUrl;
-  a.download = `links_${Date.now()}.${ext}`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-}
-
 // 7. Modals: CLI Export & Video Preview
 function initModals() {
   // CLI Modal
@@ -1578,6 +1364,8 @@ function initModals() {
     video.pause();
     video.src = '';
     document.getElementById('previewModal').style.display = 'none';
+    // 撤下预览用的头注入规则，避免离开弹窗后仍影响其他请求
+    chrome.runtime.sendMessage({ type: 'PREVIEW_RULES', action: 'clear' }, () => void chrome.runtime.lastError);
   });
 }
 
@@ -1622,6 +1410,28 @@ function openPreviewModal(mediaItem) {
   urlEl.textContent = mediaItem.url;
   video.src = mediaItem.url;
   modal.style.display = 'flex';
+
+  // 受防盗链保护的直链在扩展页面里直接播放会 403（表现为 code=4 DEMUXER_ERROR_COULD_NOT_PARSE，
+  // 播放器全黑且没有任何提示）。先让后台按嗅探到的 Referer/Cookie 注入规则再加载。
+  video.addEventListener('error', function onErr() {
+    if (video.error && video.error.code === 4) {
+      uiToast('预览失败：该直链需要 Referer/Cookie 校验，已在尝试注入凭据后重试', 'warn');
+    }
+  }, { once: true });
+
+  chrome.runtime.sendMessage({ type: 'PREVIEW_RULES', mediaItem }, (res) => {
+    void chrome.runtime.lastError;
+    // 规则装好后重新指向同一个地址，让请求带上凭据
+    if (res && res.success && (res.injected || []).length) {
+      const src = mediaItem.url;
+      video.src = '';
+      video.load();
+      video.src = src;
+      video.load();
+      const playPromise = video.play();
+      if (playPromise && playPromise.catch) playPromise.catch(() => {});
+    }
+  });
 }
 
 // ==================== 面板内弹窗 / 轻提示（替代原生 confirm / alert） ====================
@@ -1820,7 +1630,13 @@ function vpsStateLabel(st) {
 function vpsButtonHtml() {
   const v = state.settings.vps || {};
   if (!v.enabled) return '';
-  return '<button class="btn btn-sm btn-outline btn-push-vps" title="先探测播放列表（master 会弹出清晰度选择），再提交服务端下载">☁️ 探测并推送</button>';
+  return '<button class="btn btn-sm btn-primary btn-push-vps" title="主路径：先探测播放列表（master 会弹出清晰度选择），再提交服务端下载">☁️ 推送下载(主)</button>';
+}
+
+// 浏览器内下载：已降级为次要路径（mux.js 在扩展里转封装，受内存与功耗限制）。
+// 仍保留可用，但文案与样式上明确标为备用，避免误当成默认手段。
+function browserDownloadButtonHtml(extraClass) {
+  return `<button class="btn btn-sm btn-outline ${extraClass || ''}" title="备用路径：在浏览器内下载并用 mux.js 转封装为 MP4（大文件占内存）">⬇️ 浏览器下载</button>`;
 }
 
 // 批量面板按钮与任务看板的显隐

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OmniSnag - 媒体嗅探与链接提取器",
   "version": "1.8.0",
-  "description": "专业级流媒体嗅探(m3u8/mpd/fMP4·m4s/ts/mp4)、按作品归并去重与可播放性标注、防盗链请求头捕获与传参下载、远端下载桥接(探测/清晰度选择/任务看板)、历史按域名隔离并自动压缩、全网页链接检索分类、批量采集与页内面板",
+  "description": "专业级流媒体嗅探(m3u8/mpd/fMP4·m4s/ts/mp4)、按作品归并去重与可播放性标注、防盗链请求头捕获与传参下载、远端下载桥接为下载主导路径(探测/清晰度选择/任务看板)、历史按域名隔离并自动压缩、批量采集与页内面板",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
@@ -52,13 +52,6 @@
       "run_at": "document_idle",
       "world": "ISOLATED",
       "all_frames": false
-    },
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content-scripts/page-link-collector.js"],
-      "run_at": "document_idle",
-      "world": "ISOLATED",
-      "all_frames": true
     }
   ],
   "web_accessible_resources": [
